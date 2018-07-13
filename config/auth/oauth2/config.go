@@ -27,8 +27,18 @@ type OAuth2Config struct {
 	ClientSecret string        `yaml:"clientSecret"`
 	Scopes       []string      `yaml:"scopes"`
 	CachedToken  *oauth2.Token `yaml:"cachedToken,omitempty"`
+	SslConfig    *SSLConfig    `yaml:"ssl,omitempty"`
+}
+
+type SSLConfig struct {
+	CertPath string `yaml:"certPath"` // Cert is base64 encoded PEM block.
+	KeyPath  string `yaml:"keyPath"`  // Key is base64 encoded PEM block.
 }
 
 func (x *OAuth2Config) IsValid() bool {
-	return (x.TokenUrl != "" && x.AuthUrl != "" && x.ClientId != "" && x.ClientSecret != "" && len(x.Scopes) != 0)
+	sslValid := true
+	if x.SslConfig != nil {
+		sslValid = (x.SslConfig.CertPath != "" && x.SslConfig.KeyPath != "")
+	}
+	return (x.TokenUrl != "" && x.AuthUrl != "" && x.ClientId != "" && x.ClientSecret != "" && len(x.Scopes) != 0 && sslValid)
 }

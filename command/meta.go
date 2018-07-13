@@ -260,10 +260,16 @@ func (m *ApiMeta) Authenticate() error {
 			return errors.New("Incorrect OAuth2 auth configuration.")
 		}
 
+		redirectUrl := "http://localhost:8085"
+		sslEnabled := OAuth2.SslConfig != nil
+		if sslEnabled {
+			redirectUrl = "https://localhost:8085"
+		}
+
 		config := &oauth2.Config{
 			ClientID:     OAuth2.ClientId,
 			ClientSecret: OAuth2.ClientSecret,
-			RedirectURL:  "http://localhost:8085",
+			RedirectURL:  redirectUrl,
 			Scopes:       OAuth2.Scopes,
 			Endpoint: oauth2.Endpoint{
 				AuthURL:  OAuth2.AuthUrl,
@@ -288,7 +294,20 @@ func (m *ApiMeta) Authenticate() error {
 				code := r.FormValue("code")
 				fmt.Fprintln(w, code)
 			}))
-			go http.ListenAndServe(":8085", nil)
+
+			if sslEnabled {
+				// TODO(jacobkiefer): Support self-signed certs.
+				fmt.Println("ssl")
+				certPath, err := homedir.Expand(OAuth2.SslConfig.CertPath)
+				keyPath, err := homedir.Expand(OAuth2.SslConfig.KeyPath)
+				if err != nil {
+					return err
+				}
+				go http.ListenAndServeTLS(":8085", certPath, keyPath, nil)
+			} else {
+				fmt.Println("not ssl")
+				go http.ListenAndServe(":8085", nil)
+			}
 			// Note: leaving server connection open for scope of request, will be reaped on exit.
 
 			authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline, oauth2.ApprovalForce)
