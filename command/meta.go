@@ -64,7 +64,7 @@ type ApiMeta struct {
 	// This is the set of flags global to the command parser.
 	gateEndpoint string
 
-        ignoreCertErrors bool
+	insecure bool
 
 	// Location of the spin config.
 	configLocation string
@@ -78,7 +78,7 @@ func (m *ApiMeta) GlobalFlagSet(cmd string) *flag.FlagSet {
 	f.StringVar(&m.gateEndpoint, "gate-endpoint", "http://localhost:8084",
 		"Gate (API server) endpoint")
 
-        f.BoolVar(&m.ignoreCertErrors, "insecure", false, "Ignore Certificate Errors")
+	f.BoolVar(&m.insecure, "insecure", false, "Ignore Certificate Errors")
 
 	f.Usage = func() {}
 
@@ -118,7 +118,6 @@ func (m *ApiMeta) Process(args []string) ([]string, error) {
 		return args, err
 	}
 
-	// TODO(jacobkiefer): Add flag for config location?
 	m.configLocation = filepath.Join(usr.HomeDir, ".spin", "config")
 	yamlFile, err := ioutil.ReadFile(m.configLocation)
 	if err != nil {
@@ -175,10 +174,6 @@ func (m *ApiMeta) InitializeClient() (*http.Client, error) {
 		Jar: cookieJar,
 	}
 
-	if m.ignoreCertErrors {
-             http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-        }
-
 	if auth != nil && auth.Enabled && auth.X509 != nil {
 		X509 := auth.X509
 		client.Transport = &http.Transport{
@@ -191,26 +186,12 @@ func (m *ApiMeta) InitializeClient() (*http.Client, error) {
 		}
 
 		if X509.CertPath != "" && X509.KeyPath != "" {
-			certPath, err := homedir.Expand(X509.CertPath)
+			tlsConfig, err := m.initializeTLSFromPath(X509.CertPath, X509.KeyPath)
 			if err != nil {
 				return nil, err
 			}
-			keyPath, err := homedir.Expand(X509.KeyPath)
-			if err != nil {
-				return nil, err
-			}
-
-			cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-			if err != nil {
-				return nil, err
-			}
-
-			clientCA, err := ioutil.ReadFile(certPath)
-			if err != nil {
-				return nil, err
-			}
-
-			return m.initializeX509Config(client, clientCA, cert), nil
+			client.Transport.(*http.Transport).TLSClientConfig = tlsConfig
+			return &client, nil
 		} else if X509.Cert != "" && X509.Key != "" {
 			certBytes := []byte(X509.Cert)
 			keyBytes := []byte(X509.Key)
@@ -219,7 +200,9 @@ func (m *ApiMeta) InitializeClient() (*http.Client, error) {
 				return nil, err
 			}
 
-			return m.initializeX509Config(client, certBytes, cert), nil
+			tlsConfig := m.initializeTLSFromCert(certBytes, cert)
+			client.Transport.(*http.Transport).TLSClientConfig = tlsConfig
+			return &client, nil
 		} else {
 			// Misconfigured.
 			return nil, errors.New("Incorrect x509 auth configuration.\nMust specify certPath/keyPath or cert/key pair.")
@@ -238,22 +221,50 @@ func (m *ApiMeta) InitializeClient() (*http.Client, error) {
 	}
 }
 
-func (m *ApiMeta) initializeX509Config(client http.Client, clientCA []byte, cert tls.Certificate) *http.Client {
+func (m *ApiMeta) initializeTLSFromPath(certPath string, keyPath string) (*tls.Config, error) {
+	certFullPath, err := homedir.Expand(certPath)
+	if err != nil {
+		return nil, err
+	}
+	keyFullPath, err := homedir.Expand(keyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	cert, err := tls.LoadX509KeyPair(certFullPath, keyFullPath)
+	if err != nil {
+		return nil, err
+	}
+
+	clientCA, err := ioutil.ReadFile(certFullPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return m.initializeTLSFromCert(clientCA, cert), nil
+}
+
+func (m *ApiMeta) initializeTLSFromCert(clientCA []byte, cert tls.Certificate) *tls.Config {
 	clientCertPool := x509.NewCertPool()
 	clientCertPool.AppendCertsFromPEM(clientCA)
 
-	client.Transport.(*http.Transport).TLSClientConfig.MinVersion = tls.VersionTLS12
-	client.Transport.(*http.Transport).TLSClientConfig.PreferServerCipherSuites = true
-	client.Transport.(*http.Transport).TLSClientConfig.Certificates = []tls.Certificate{cert}
- 	if m.ignoreCertErrors {
-           client.Transport.(*http.Transport).TLSClientConfig.InsecureSkipVerify = true
-        }
-	return &client
+	return &tls.Config{
+		Certificates:             []tls.Certificate{cert},
+		ClientCAs:                clientCertPool,
+		InsecureSkipVerify:       m.insecure,
+		MinVersion:               tls.VersionTLS12,
+		PreferServerCipherSuites: true,
+	}
 }
 
 func (m *ApiMeta) Authenticate() error {
 	auth := m.Config.Auth
 	if auth != nil && auth.Enabled && auth.OAuth2 != nil {
+		var newToken *oauth2.Token
+		var err error
+		var tlsConfig *tls.Config
+		var certPath, keyPath string
+
 		OAuth2 := auth.OAuth2
 		if !OAuth2.IsValid() {
 			// TODO(jacobkiefer): Improve this error message.
@@ -264,6 +275,12 @@ func (m *ApiMeta) Authenticate() error {
 		sslEnabled := OAuth2.SslConfig != nil
 		if sslEnabled {
 			redirectUrl = "https://localhost:8085"
+			certPath, err := homedir.Expand(OAuth2.SslConfig.CertPath)
+			keyPath, err := homedir.Expand(OAuth2.SslConfig.KeyPath)
+			tlsConfig, err = m.initializeTLSFromPath(certPath, keyPath)
+			if err != nil {
+				return err
+			}
 		}
 
 		config := &oauth2.Config{
@@ -276,13 +293,18 @@ func (m *ApiMeta) Authenticate() error {
 				TokenURL: OAuth2.TokenUrl,
 			},
 		}
-		var newToken *oauth2.Token
-		var err error
+
+		cookieJar, _ := cookiejar.New(nil)
+		client := &http.Client{
+			Jar:       cookieJar,
+			Transport: &http.Transport{TLSClientConfig: tlsConfig},
+		}
+		oauthContext := context.WithValue(context.Background(), oauth2.HTTPClient, client)
 
 		if auth.OAuth2.CachedToken != nil {
 			// Look up cached credentials to save oauth2 roundtrip.
 			token := auth.OAuth2.CachedToken
-			tokenSource := config.TokenSource(oauth2.NoContext, token)
+			tokenSource := config.TokenSource(oauthContext, token)
 			newToken, err = tokenSource.Token()
 			if err != nil {
 				m.Ui.Error(fmt.Sprintf("Could not refresh token from source: %v", tokenSource))
@@ -290,23 +312,19 @@ func (m *ApiMeta) Authenticate() error {
 			}
 		} else {
 			// Do roundtrip.
-			http.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				code := r.FormValue("code")
-				fmt.Fprintln(w, code)
-			}))
-
 			if sslEnabled {
-				// TODO(jacobkiefer): Support self-signed certs.
-				fmt.Println("ssl")
-				certPath, err := homedir.Expand(OAuth2.SslConfig.CertPath)
-				keyPath, err := homedir.Expand(OAuth2.SslConfig.KeyPath)
-				if err != nil {
-					return err
+				srv := &http.Server{
+					Addr:      ":8085",
+					Handler:   &handler{},
+					TLSConfig: tlsConfig,
 				}
-				go http.ListenAndServeTLS(":8085", certPath, keyPath, nil)
+				go srv.ListenAndServeTLS(certPath, keyPath)
 			} else {
-				fmt.Println("not ssl")
-				go http.ListenAndServe(":8085", nil)
+				srv := &http.Server{
+					Addr:    ":8085",
+					Handler: &handler{},
+				}
+				go srv.ListenAndServe()
 			}
 			// Note: leaving server connection open for scope of request, will be reaped on exit.
 
@@ -314,7 +332,7 @@ func (m *ApiMeta) Authenticate() error {
 			m.Ui.Output(fmt.Sprintf("Navigate to %s and authenticate", authURL))
 			code := m.Prompt()
 
-			newToken, err = config.Exchange(oauth2.NoContext, code)
+			newToken, err = config.Exchange(oauthContext, code)
 			if err != nil {
 				return err
 			}
@@ -328,6 +346,14 @@ func (m *ApiMeta) Authenticate() error {
 		m.Context = context.WithValue(context.Background(), gate.ContextAccessToken, newToken.AccessToken)
 	}
 	return nil
+}
+
+// handler is an HTTP handler to
+type handler struct{}
+
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	code := r.FormValue("code")
+	fmt.Fprintln(w, code)
 }
 
 func (m *ApiMeta) Prompt() string {

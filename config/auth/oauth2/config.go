@@ -31,8 +31,8 @@ type OAuth2Config struct {
 }
 
 type SSLConfig struct {
-	CertPath string `yaml:"certPath"` // Cert is base64 encoded PEM block.
-	KeyPath  string `yaml:"keyPath"`  // Key is base64 encoded PEM block.
+	CertPath string `yaml:"certPath"`
+	KeyPath  string `yaml:"keyPath"`
 }
 
 func (x *OAuth2Config) IsValid() bool {
