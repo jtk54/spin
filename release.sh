@@ -104,3 +104,4 @@ echo $VERSION > latest
 gsutil cp latest ${SPIN_GCS_BUCKET_PATH}/
 a
 a
+a
